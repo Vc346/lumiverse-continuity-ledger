@@ -5,6 +5,7 @@ function fixture() {
   const storage = new Map();
   const chats = new Map();
   const characters = new Map();
+  const presets = new Map();
   const messages = new Map();
   const calls = [];
   let activeChatId = null;
@@ -20,6 +21,13 @@ function fixture() {
     },
     characters: {
       get: async (id) => structuredClone(characters.get(id) ?? null),
+    },
+    presets: {
+      list: async () => {
+        const data = [...presets.values()];
+        return { data: structuredClone(data), total: data.length };
+      },
+      get: async (id) => structuredClone(presets.get(id) ?? null),
     },
     connections: {
       list: async () => [{ id: "conn-1", name: "Fast Model" }],
@@ -49,6 +57,7 @@ function fixture() {
     host,
     chats,
     characters,
+    presets,
     messages,
     calls,
     setActive: (id) => (activeChatId = id),
@@ -175,4 +184,50 @@ test("auto-update triggers only when enabled and interval of assistant replies i
   expect(triggered.ledger.source).toBe("auto");
   expect(f.calls[0].connection_id).toBe("conn-1");
   expect(f.calls[0].messages[0].content).toContain(DEFAULT_LEDGER_PROMPT);
+});
+
+test("lists preset blocks and injects selected blocks when updating the ledger", async () => {
+  const f = fixture();
+  const run = ledgerService(f.host);
+
+  f.presets.set("preset-1", {
+    id: "preset-1",
+    name: "Creative Preset",
+    prompt_order: [
+      { identifier: "framing", name: "Fiction Framing", role: "system", enabled: true, content: "Keep notes strictly factual." },
+      { identifier: "hist", name: "Chat History", marker: true, enabled: true, content: "" },
+      { identifier: "extra", name: "Format Hint", role: "user", enabled: false, content: "Use concise bullet points." },
+    ],
+  });
+  f.chats.set("chat-3", { id: "chat-3", name: "Scene" });
+  f.messages.set("chat-3", [
+    { id: "m1", role: "user", content: "We agreed to meet at dawn." },
+    { id: "m2", role: "assistant", content: "She nods and pockets the letter." },
+  ]);
+
+  const blocks = await run("alice", { action: "preset_blocks", presetId: "preset-1" });
+  expect(blocks.blocks).toEqual([
+    { id: "framing", name: "Fiction Framing", role: "system", enabled: true },
+    { id: "extra", name: "Format Hint", role: "user", enabled: false },
+  ]);
+
+  await run("alice", {
+    action: "save_settings",
+    chatId: "chat-3",
+    autoUpdate: false,
+    interval: 6,
+    skipRecent: 0,
+    presetId: "preset-1",
+    presetBlockIds: ["framing", "extra"],
+    fallbackPrompt: "",
+  });
+
+  f.respond("- Meeting planned at dawn.\n- She holds the letter.");
+  await run("alice", { action: "update", chatId: "chat-3" });
+  const sent = f.calls.at(-1).messages;
+  expect(sent[0].role).toBe("system");
+  expect(sent[0].content).toContain("Keep notes strictly factual.");
+  expect(sent[0].content).toContain(DEFAULT_LEDGER_PROMPT);
+  expect(sent[1]).toEqual({ role: "user", content: "Use concise bullet points." });
+  expect(sent[2].role).toBe("user");
 });

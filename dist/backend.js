@@ -20,6 +20,8 @@ var DEFAULT_SETTINGS = {
   interval: 6,
   skipRecent: 2,
   connectionId: "",
+  presetId: "",
+  presetBlockIds: [],
   fallbackPrompt: ""
 };
 function check(ok, message) {
@@ -30,14 +32,45 @@ function string(value, label, max = 1e5) {
   check(typeof value === "string" && value.length <= max, "Invalid " + label + ".");
   return value;
 }
+function presetBlocksOf(record) {
+  if (!Array.isArray(record?.prompt_order))
+    return [];
+  const blocks = [];
+  record.prompt_order.forEach((b, index) => {
+    if (!b || b.marker || typeof b.content !== "string" || !b.content.trim())
+      return;
+    const id = String(b.identifier ?? b.id ?? (b.name || "block") + "#" + index);
+    blocks.push({
+      id,
+      name: typeof b.name === "string" && b.name.trim() ? b.name.trim() : "Block " + (index + 1),
+      role: b.role === "user" || b.role === "assistant" ? b.role : "system",
+      enabled: b.enabled !== false,
+      content: b.content.trim()
+    });
+  });
+  return blocks;
+}
+async function pages(fetchPage) {
+  const result = [];
+  while (true) {
+    const { data, total } = await fetchPage(result.length);
+    result.push(...data);
+    if (!data.length || result.length >= total)
+      return result;
+  }
+}
 function normalizeSettings(raw) {
   const interval = Number(raw?.interval);
   const skipRecent = raw?.skipRecent === undefined || raw?.skipRecent === "" ? DEFAULT_SETTINGS.skipRecent : Number(raw.skipRecent);
+  const presetId = typeof raw?.presetId === "string" ? raw.presetId : "";
+  const presetBlockIds = presetId && Array.isArray(raw?.presetBlockIds) ? raw.presetBlockIds.filter((id) => typeof id === "string" && id) : [];
   return {
     autoUpdate: Boolean(raw?.autoUpdate),
     interval: Number.isFinite(interval) ? Math.max(1, Math.min(50, Math.round(interval))) : DEFAULT_SETTINGS.interval,
     skipRecent: Number.isFinite(skipRecent) ? Math.max(0, Math.min(20, Math.round(skipRecent))) : DEFAULT_SETTINGS.skipRecent,
     connectionId: typeof raw?.connectionId === "string" ? raw.connectionId : "",
+    presetId,
+    presetBlockIds,
     fallbackPrompt: typeof raw?.fallbackPrompt === "string" ? raw.fallbackPrompt : ""
   };
 }
@@ -185,9 +218,42 @@ function ledgerService(host) {
     const rows = await host.connections.list(userId);
     return (rows ?? []).map(({ id, name }) => ({ id, name }));
   }
+  async function listPresets(userId) {
+    if (!host.presets?.list)
+      return [];
+    try {
+      const rows = await pages((offset) => host.presets.list({ offset, limit: 100, userId }));
+      return rows.map(({ id, name }) => ({ id, name }));
+    } catch (error) {
+      if (String(error?.message).includes("PERMISSION_DENIED"))
+        return [];
+      throw error;
+    }
+  }
+  async function resolvePresetExtras(settings, userId) {
+    if (!settings.presetId || !settings.presetBlockIds.length || !host.presets?.get) {
+      return { systemExtras: [], extraMessages: [] };
+    }
+    try {
+      const record = await host.presets.get(settings.presetId, userId);
+      const wanted = new Set(settings.presetBlockIds);
+      const chosen = presetBlocksOf(record).filter((b) => wanted.has(b.id));
+      return {
+        systemExtras: chosen.filter((b) => b.role === "system").map((b) => b.content),
+        extraMessages: chosen.filter((b) => b.role !== "system").map(({ role, content }) => ({ role, content }))
+      };
+    } catch (error) {
+      if (String(error?.message).includes("PERMISSION_DENIED"))
+        return { systemExtras: [], extraMessages: [] };
+      throw error;
+    }
+  }
   async function buildStatus(state, chatId, userId) {
-    const chat = await resolveChat(chatId, userId);
-    const connections = await listConnections(userId);
+    const [chat, connections, presets] = await Promise.all([
+      resolveChat(chatId, userId),
+      listConnections(userId),
+      listPresets(userId)
+    ]);
     if (!chat?.id) {
       return {
         chat: null,
@@ -197,7 +263,8 @@ function ledgerService(host) {
         pendingAssistantTurns: 0,
         heldBackTurns: 0,
         settings: state.settings,
-        connections
+        connections,
+        presets
       };
     }
     const record = state.ledgers[chat.id] ?? null;
@@ -225,7 +292,8 @@ function ledgerService(host) {
       pendingAssistantTurns,
       heldBackTurns,
       settings: state.settings,
-      connections
+      connections,
+      presets
     };
   }
   async function runUpdate(state, chatId, userId, { rebuild = false, source = "manual" } = {}) {
@@ -239,9 +307,10 @@ function ledgerService(host) {
     const fresh = selectNewMessages(eligible, existing, rebuild);
     check(fresh.length > 0, "The ledger is already up to date with settled messages.");
     const { prompt } = await resolvePrompt(chat, state.settings, userId);
+    const { systemExtras, extraMessages } = await resolvePresetExtras(state.settings, userId);
     const existingText = !rebuild && existing?.content?.trim() ? existing.content.trim() : "(empty \u2014 initial pass)";
     const transcript = formatTranscript(fresh);
-    const systemMessage = [
+    const baseSystemMessage = [
       prompt,
       "",
       "Rules:",
@@ -250,6 +319,11 @@ function ledgerService(host) {
       "- Keep entries concise and scannable."
     ].join(`
 `);
+    const systemMessage = systemExtras.length ? systemExtras.join(`
+
+`) + `
+
+` + baseSystemMessage : baseSystemMessage;
     const userMessage = [
       "Existing continuity ledger:",
       existingText,
@@ -263,6 +337,7 @@ function ledgerService(host) {
       connection_id: state.settings.connectionId || undefined,
       messages: [
         { role: "system", content: systemMessage },
+        ...extraMessages,
         { role: "user", content: userMessage }
       ]
     });
@@ -286,12 +361,33 @@ function ledgerService(host) {
     if (req.action === "load") {
       return buildStatus(state, req.chatId, userId);
     }
+    if (req.action === "preset_blocks") {
+      if (!req.presetId || typeof req.presetId !== "string" || !host.presets?.get)
+        return { blocks: [] };
+      try {
+        const record = await host.presets.get(req.presetId, userId);
+        return {
+          blocks: presetBlocksOf(record).map(({ id, name, role, enabled }) => ({
+            id,
+            name,
+            role,
+            enabled
+          }))
+        };
+      } catch (error) {
+        if (String(error?.message).includes("PERMISSION_DENIED"))
+          return { blocks: [] };
+        throw error;
+      }
+    }
     if (req.action === "save_settings") {
       state.settings = normalizeSettings({
         autoUpdate: req.autoUpdate,
         interval: req.interval,
         skipRecent: req.skipRecent,
         connectionId: req.connectionId ?? "",
+        presetId: req.presetId ?? "",
+        presetBlockIds: req.presetBlockIds ?? [],
         fallbackPrompt: string(req.fallbackPrompt ?? "", "fallback ledger prompt")
       });
       await writeState(host.userStorage, userId, state);

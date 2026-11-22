@@ -215,6 +215,18 @@ export function setup(ctx) {
       gap: 8px;
       cursor: pointer;
     }
+    .vv-ledger .vv-checkbox input { accent-color: var(--lumiverse-accent, #8c70c7) }
+    .vv-ledger details {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 8px;
+      padding: 10px;
+      border: 1px solid var(--lumiverse-border);
+      border-radius: var(--lumiverse-radius, 8px);
+      background: var(--lumiverse-fill-subtle);
+    }
+    .vv-ledger details > summary { cursor: pointer; font-weight: 600 }
+    .vv-ledger .vv-block-meta { color: var(--lumiverse-text-muted); font-size: .82em }
   `);
 
   let alive = true;
@@ -232,8 +244,13 @@ export function setup(ctx) {
     interval: 6,
     skipRecent: 2,
     connectionId: "",
+    presetId: "",
+    presetBlockIds: [],
     fallbackPrompt: "",
   };
+  const presetBlocksCache = new Map();
+  let loadingPresetBlocks = "";
+  let blocksSectionOpen = false;
 
   const components = [];
   function destroyComponents() {
@@ -274,9 +291,27 @@ export function setup(ctx) {
     state = data;
     if (data.chat?.id) activeChatId = data.chat.id;
     if (syncSettings && data.settings) {
-      settingsDraft = { ...data.settings };
+      settingsDraft = {
+        ...data.settings,
+        presetBlockIds: [...(data.settings.presetBlockIds ?? [])],
+      };
+      if (settingsDraft.presetId) loadPresetBlocks(settingsDraft.presetId);
     }
     if (!data.ledger?.previousContent && mode === "diff") mode = "view";
+  }
+
+  async function loadPresetBlocks(id) {
+    if (!id || presetBlocksCache.has(id) || loadingPresetBlocks === id) return;
+    loadingPresetBlocks = id;
+    try {
+      const data = await rpc({ action: "preset_blocks", presetId: id });
+      presetBlocksCache.set(id, data.blocks ?? []);
+    } catch {
+      presetBlocksCache.set(id, []);
+    } finally {
+      if (loadingPresetBlocks === id) loadingPresetBlocks = "";
+      if (alive && activeView === "settings") render();
+    }
   }
 
   async function run(action, args = {}, label = "Loading…") {
@@ -583,6 +618,63 @@ export function setup(ctx) {
       settingsDraft.connectionId,
       (v) => (settingsDraft.connectionId = v),
     );
+
+    if (state?.presets?.length) {
+      select(
+        form,
+        "Preset (optional blocks)",
+        [{ id: "", name: "No preset" }, ...state.presets],
+        settingsDraft.presetId ?? "",
+        (v) => {
+          if (v === settingsDraft.presetId) return;
+          settingsDraft.presetId = v;
+          settingsDraft.presetBlockIds = [];
+          if (v) loadPresetBlocks(v);
+          render();
+        },
+      );
+      if (settingsDraft.presetId) {
+        const blocks = presetBlocksCache.get(settingsDraft.presetId);
+        if (!blocks) {
+          loadPresetBlocks(settingsDraft.presetId);
+          element(form, "p", "Loading preset blocks…").className = "vv-status";
+        } else if (blocks.length) {
+          const chosen = new Set(settingsDraft.presetBlockIds ?? []);
+          const count = blocks.filter((b) => chosen.has(b.id)).length;
+          const details = element(form, "details");
+          details.open = blocksSectionOpen;
+          details.ontoggle = () => (blocksSectionOpen = details.open);
+          element(details, "summary", "Include preset blocks (" + count + " selected)");
+          element(
+            details,
+            "p",
+            "Selected blocks are sent alongside the ledger prompt when updating.",
+          ).className = "vv-status";
+          for (const block of blocks) {
+            const row = element(details, "label");
+            row.className = "vv-checkbox";
+            const box = document.createElement("input");
+            box.type = "checkbox";
+            box.checked = chosen.has(block.id);
+            box.disabled = busy;
+            box.onchange = () => {
+              if (box.checked) chosen.add(block.id);
+              else chosen.delete(block.id);
+              settingsDraft.presetBlockIds = [...chosen];
+              render();
+            };
+            row.appendChild(box);
+            element(row, "span", block.name);
+            const meta = element(
+              row,
+              "span",
+              "(" + block.role + (block.enabled ? "" : ", disabled") + ")",
+            );
+            meta.className = "vv-block-meta";
+          }
+        }
+      }
+    }
 
     const promptLabel = element(form, "label", "Generic fallback ledger prompt");
     promptLabel.className = "vv-field";

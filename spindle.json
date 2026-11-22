@@ -1,0 +1,12 @@
+{
+  "identifier": "voidverse_ledger",
+  "name": "Continuity Ledger",
+  "version": "0.1.0",
+  "author": "VoidVerse",
+  "github": "https://github.com/Vc346/lumiverse-continuity-ledger",
+  "homepage": "https://github.com/Vc346/lumiverse-continuity-ledger",
+  "description": "Maintain a living per-chat continuity ledger of lasting facts, relationships, secrets, and state.",
+  "permissions": ["generation", "characters", "chats", "chat_mutation"],
+  "entry_backend": "dist/backend.js",
+  "entry_frontend": "dist/frontend.js"
+}

@@ -231,3 +231,29 @@ test("lists preset blocks and injects selected blocks when updating the ledger",
   expect(sent[1]).toEqual({ role: "user", content: "Use concise bullet points." });
   expect(sent[2].role).toBe("user");
 });
+
+test("forgeLedger resolves when env.extra omits chatId by falling back to active chat or characterId", async () => {
+  const f = fixture();
+  registerLedgerMacro(f.host);
+  const run = ledgerService(f.host);
+
+  f.chats.set("chat-a", { id: "chat-a", name: "Chat A", character_id: "char-a" });
+  f.setActive("chat-a");
+  await run("alice", { action: "save_edit", chatId: "chat-a", content: "- Active chat fact." });
+
+  // Case 1: env.extra has only characterId + userId, chats.getActive returns active chat
+  expect(
+    await f.host._macro.handler({ env: { extra: { characterId: "char-a", userId: "alice" } } }),
+  ).toBe("- Active chat fact.");
+
+  // Case 2: chats.getActive is unavailable, falls back to lastActiveChatId / characterId match
+  f.setActive(null);
+  expect(
+    await f.host._macro.handler({ env: { extra: { characterId: "char-a", userId: "alice" } } }),
+  ).toBe("- Active chat fact.");
+
+  // Case 3: env.chat.id is provided directly
+  expect(
+    await f.host._macro.handler({ env: { chat: { id: "chat-a" }, extra: { userId: "alice" } } }),
+  ).toBe("- Active chat fact.");
+});

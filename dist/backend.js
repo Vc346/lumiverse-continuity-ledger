@@ -97,14 +97,22 @@ function normalizeMessage(raw) {
     content
   };
 }
+function firstString(...values) {
+  for (const value of values) {
+    if (typeof value === "string" && value.trim())
+      return value.trim();
+  }
+  return null;
+}
 async function readState(storage, userId) {
   if (!await storage.exists(FILE, userId)) {
-    return { settings: { ...DEFAULT_SETTINGS }, ledgers: {} };
+    return { settings: { ...DEFAULT_SETTINGS }, ledgers: {}, lastActiveChatId: null };
   }
   const saved = await storage.getJson(FILE, { userId });
   return {
     settings: normalizeSettings(saved?.settings),
-    ledgers: saved?.ledgers && typeof saved.ledgers === "object" ? saved.ledgers : {}
+    ledgers: saved?.ledgers && typeof saved.ledgers === "object" ? saved.ledgers : {},
+    lastActiveChatId: typeof saved?.lastActiveChatId === "string" ? saved.lastActiveChatId : null
   };
 }
 async function writeState(storage, userId, state) {
@@ -166,11 +174,37 @@ function registerLedgerMacro(host) {
     description: "Current continuity ledger for the active roleplay chat.",
     returnType: "string",
     volatile: true,
-    async handler({ env }) {
-      const { chatId, userId } = env?.extra ?? {};
-      if (typeof chatId !== "string" || !chatId || typeof userId !== "string" || !userId)
+    async handler(ctx) {
+      const env = ctx?.env ?? {};
+      const extra = env.extra ?? {};
+      const userId = firstString(extra.userId, extra.user_id, env.userId, env.user?.id, ctx?.userId);
+      if (!userId)
         return "";
+      const characterId = firstString(extra.characterId, extra.character_id, env.characterId, env.character?.id, ctx?.characterId);
+      let chatId = firstString(extra.chatId, extra.chat_id, env.chatId, env.chat_id, env.chat?.id, ctx?.chatId);
+      if (!chatId && host.chats?.getActive) {
+        try {
+          let active = null;
+          try {
+            active = await host.chats.getActive(userId);
+          } catch {
+            active = await host.chats.getActive();
+          }
+          chatId = firstString(active?.id);
+        } catch {}
+      }
       const state = await readState(host.userStorage, userId);
+      if (!chatId) {
+        const last = state.lastActiveChatId ? state.ledgers[state.lastActiveChatId] : null;
+        if (last && (!characterId || !last.characterId || last.characterId === characterId)) {
+          chatId = state.lastActiveChatId;
+        } else if (characterId) {
+          const matching = Object.values(state.ledgers).filter((item) => item?.characterId === characterId && typeof item.content === "string" && item.content.trim()).sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
+          chatId = matching[0]?.chatId ?? null;
+        }
+      }
+      if (!chatId)
+        return "";
       const content = state.ledgers[chatId]?.content;
       return typeof content === "string" ? content.trim() : "";
     }
@@ -344,8 +378,10 @@ function ledgerService(host) {
     const content = stripReasoning(string(result?.content ?? "", "model response", 200000));
     check(content, "The model returned an empty ledger.");
     const last = eligible.at(-1);
+    state.lastActiveChatId = chat.id;
     state.ledgers[chat.id] = {
       chatId: chat.id,
+      characterId: chat.character_id ?? existing?.characterId ?? null,
       content,
       previousContent: existing ? existing.content : null,
       lastMessageId: last?.id ?? null,
@@ -359,7 +395,12 @@ function ledgerService(host) {
   async function execute(userId, req) {
     const state = await readState(host.userStorage, userId);
     if (req.action === "load") {
-      return buildStatus(state, req.chatId, userId);
+      const status = await buildStatus(state, req.chatId, userId);
+      if (status.chat?.id && state.lastActiveChatId !== status.chat.id) {
+        state.lastActiveChatId = status.chat.id;
+        await writeState(host.userStorage, userId, state);
+      }
+      return status;
     }
     if (req.action === "preset_blocks") {
       if (!req.presetId || typeof req.presetId !== "string" || !host.presets?.get)
@@ -424,8 +465,10 @@ function ledgerService(host) {
       check(chat?.id, "Open a roleplay chat to edit its ledger.");
       const content = string(req.content, "ledger content").trim();
       const existing = state.ledgers[chat.id] ?? null;
+      state.lastActiveChatId = chat.id;
       state.ledgers[chat.id] = {
         chatId: chat.id,
+        characterId: chat.character_id ?? existing?.characterId ?? null,
         content,
         previousContent: existing ? existing.content : null,
         lastMessageId: existing?.lastMessageId ?? null,

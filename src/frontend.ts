@@ -230,6 +230,7 @@ export function setup(ctx) {
   let settingsDraft = {
     autoUpdate: false,
     interval: 6,
+    skipRecent: 2,
     connectionId: "",
     fallbackPrompt: "",
   };
@@ -317,6 +318,7 @@ export function setup(ctx) {
             ...state,
             pendingTurns: result.pendingTurns,
             pendingAssistantTurns: result.pendingAssistantTurns ?? state.pendingAssistantTurns,
+            heldBackTurns: result.heldBackTurns ?? state.heldBackTurns,
           };
           render();
         }
@@ -445,7 +447,10 @@ export function setup(ctx) {
     meta.className = "vv-meta";
     element(meta, "span", promptSourceLabels[state.promptSource] ?? promptSourceLabels.default);
     const pending = state.pendingTurns ?? 0;
-    element(meta, "span", pending > 0 ? "· " + pending + (pending === 1 ? " new message" : " new messages") : "· Up to date");
+    element(meta, "span", pending > 0 ? "· " + pending + " ready" : "· Up to date");
+    if (state.heldBackTurns > 0) {
+      element(meta, "span", "· " + state.heldBackTurns + " recent held back");
+    }
     if (state.settings?.autoUpdate) {
       element(meta, "span", "· Auto every " + state.settings.interval + " replies");
     }
@@ -556,6 +561,20 @@ export function setup(ctx) {
     intervalInput.value = String(settingsDraft.interval);
     intervalInput.disabled = busy;
     intervalInput.oninput = () => (settingsDraft.interval = Number(intervalInput.value) || 6);
+
+    const skipLabel = element(form, "label", "Skip latest N messages (swipe/edit buffer)");
+    skipLabel.className = "vv-field";
+    const skipInput = element(skipLabel, "input");
+    skipInput.className = "vv-input";
+    skipInput.type = "number";
+    skipInput.min = "0";
+    skipInput.max = "20";
+    skipInput.value = String(settingsDraft.skipRecent ?? 2);
+    skipInput.disabled = busy;
+    skipInput.oninput = () => {
+      const value = Number(skipInput.value);
+      settingsDraft.skipRecent = Number.isFinite(value) ? value : 0;
+    };
 
     select(
       form,

@@ -77,9 +77,21 @@ test("uses card Forge ledger_prompt, updates incrementally, supports undo, manua
     { id: "m2", role: "assistant", name: "Asuka", content: "Fine. 7 PM in SoHo, don't be late." },
   ]);
 
+  // Default skipRecent is 2, so the first exchange is held back for swiping/editing
+  const held = await run("alice", { action: "load" });
+  expect(held.promptSource).toBe("card");
+  expect(held.pendingTurns).toBe(0);
+  expect(held.heldBackTurns).toBe(2);
+  await expect(run("alice", { action: "update", chatId: "chat-1" })).rejects.toThrow("Not enough settled messages");
+
+  // Once a second exchange arrives, m1-m2 are settled and m3-m4 are held back
+  f.messages.get("chat-1").push(
+    { id: "m3", role: "user", name: "Alex", content: "I brought the spare key." },
+    { id: "m4", role: "assistant", name: "Asuka", content: "She pockets the key without saying a word." },
+  );
   const initial = await run("alice", { action: "load" });
-  expect(initial.promptSource).toBe("card");
   expect(initial.pendingTurns).toBe(2);
+  expect(initial.heldBackTurns).toBe(2);
   expect(await f.host._macro.handler({ env: { extra: { chatId: "chat-1", userId: "alice" } } })).toBe("");
 
   f.respond("- Thursday 7 PM: Dinner with Alex in SoHo.");
@@ -87,21 +99,25 @@ test("uses card Forge ledger_prompt, updates incrementally, supports undo, manua
   expect(first.ledger.content).toBe("- Thursday 7 PM: Dinner with Alex in SoHo.");
   expect(first.ledger.previousContent).toBeNull();
   expect(first.pendingTurns).toBe(0);
+  expect(first.heldBackTurns).toBe(2);
   expect(f.calls[0].messages[0].content).toContain("Track Asuka's NYC shoot schedule");
+  expect(f.calls[0].messages[1].content).toContain("Meet me after the shoot on Thursday.");
+  expect(f.calls[0].messages[1].content).not.toContain("I brought the spare key.");
   expect(await f.host._macro.handler({ env: { extra: { chatId: "chat-1", userId: "alice" } } })).toBe(
     "- Thursday 7 PM: Dinner with Alex in SoHo.",
   );
 
-  // Add a new turn and run incremental update
+  // Add a third exchange -> m3-m4 become settled and are processed incrementally
   f.messages.get("chat-1").push(
-    { id: "m3", role: "user", name: "Alex", content: "I brought the spare key." },
-    { id: "m4", role: "assistant", name: "Asuka", content: "She pockets the key without saying a word." },
+    { id: "m5", role: "user", name: "Alex", content: "See you tomorrow." },
+    { id: "m6", role: "assistant", name: "Asuka", content: "Don't forget your coat." },
   );
   f.respond("- Thursday 7 PM: Dinner with Alex in SoHo.\n- Asuka holds the spare key.");
   const second = await run("alice", { action: "update", chatId: "chat-1" });
   expect(second.ledger.previousContent).toBe("- Thursday 7 PM: Dinner with Alex in SoHo.");
   expect(f.calls[1].messages[1].content).toContain("I brought the spare key.");
   expect(f.calls[1].messages[1].content).not.toContain("Meet me after the shoot on Thursday.");
+  expect(f.calls[1].messages[1].content).not.toContain("See you tomorrow.");
 
   // Undo restores previousContent and makes undo reversible
   const undone = await run("alice", { action: "undo", chatId: "chat-1" });
@@ -131,12 +147,13 @@ test("auto-update triggers only when enabled and interval of assistant replies i
   // Disabled by default
   expect((await run("alice", { action: "maybe_auto_update", chatId: "chat-2" })).updated).toBe(false);
 
-  // Enable auto-update every 2 assistant replies with a fallback prompt
+  // Enable auto-update every 2 assistant replies with skipRecent = 0
   await run("alice", {
     action: "save_settings",
     chatId: "chat-2",
     autoUpdate: true,
     interval: 2,
+    skipRecent: 0,
     connectionId: "conn-1",
     fallbackPrompt: "",
   });

@@ -18,6 +18,7 @@ Update the existing ledger in place: keep still-true facts, update changed facts
 var DEFAULT_SETTINGS = {
   autoUpdate: false,
   interval: 6,
+  skipRecent: 2,
   connectionId: "",
   fallbackPrompt: ""
 };
@@ -31,9 +32,11 @@ function string(value, label, max = 1e5) {
 }
 function normalizeSettings(raw) {
   const interval = Number(raw?.interval);
+  const skipRecent = raw?.skipRecent === undefined || raw?.skipRecent === "" ? DEFAULT_SETTINGS.skipRecent : Number(raw.skipRecent);
   return {
     autoUpdate: Boolean(raw?.autoUpdate),
     interval: Number.isFinite(interval) ? Math.max(1, Math.min(50, Math.round(interval))) : DEFAULT_SETTINGS.interval,
+    skipRecent: Number.isFinite(skipRecent) ? Math.max(0, Math.min(20, Math.round(skipRecent))) : DEFAULT_SETTINGS.skipRecent,
     connectionId: typeof raw?.connectionId === "string" ? raw.connectionId : "",
     fallbackPrompt: typeof raw?.fallbackPrompt === "string" ? raw.fallbackPrompt : ""
   };
@@ -87,6 +90,11 @@ async function fetchMessages(host, chatId, userId) {
   }
   const list = Array.isArray(raw) ? raw : Array.isArray(raw?.data) ? raw.data : Array.isArray(raw?.messages) ? raw.messages : [];
   return list.map(normalizeMessage).filter(Boolean);
+}
+function eligibleMessages(messages, skipRecent) {
+  if (!skipRecent || skipRecent <= 0)
+    return messages;
+  return skipRecent >= messages.length ? [] : messages.slice(0, messages.length - skipRecent);
 }
 function selectNewMessages(messages, record, rebuild) {
   if (rebuild || !record?.content) {
@@ -187,6 +195,7 @@ function ledgerService(host) {
         promptSource: state.settings.fallbackPrompt.trim() ? "fallback" : "default",
         pendingTurns: 0,
         pendingAssistantTurns: 0,
+        heldBackTurns: 0,
         settings: state.settings,
         connections
       };
@@ -195,9 +204,12 @@ function ledgerService(host) {
     const { source, cardName } = await resolvePrompt(chat, state.settings, userId);
     let pendingTurns = 0;
     let pendingAssistantTurns = 0;
+    let heldBackTurns = 0;
     try {
       const messages = await fetchMessages(host, chat.id, userId);
-      const fresh = selectNewMessages(messages, record, false);
+      const eligible = eligibleMessages(messages, state.settings.skipRecent);
+      heldBackTurns = messages.length - eligible.length;
+      const fresh = selectNewMessages(eligible, record, false);
       pendingTurns = fresh.length;
       pendingAssistantTurns = fresh.filter((m) => m.role === "assistant").length;
     } catch {}
@@ -211,6 +223,7 @@ function ledgerService(host) {
       promptSource: source,
       pendingTurns,
       pendingAssistantTurns,
+      heldBackTurns,
       settings: state.settings,
       connections
     };
@@ -220,9 +233,11 @@ function ledgerService(host) {
     check(chat?.id, "Open a roleplay chat to update its ledger.");
     const messages = await fetchMessages(host, chat.id, userId);
     check(messages.length > 0, "This chat has no messages yet.");
+    const eligible = eligibleMessages(messages, state.settings.skipRecent);
+    check(eligible.length > 0, "Not enough settled messages yet (skipping the latest " + state.settings.skipRecent + ").");
     const existing = state.ledgers[chat.id] ?? null;
-    const fresh = selectNewMessages(messages, existing, rebuild);
-    check(fresh.length > 0, "The ledger is already up to date with the latest messages.");
+    const fresh = selectNewMessages(eligible, existing, rebuild);
+    check(fresh.length > 0, "The ledger is already up to date with settled messages.");
     const { prompt } = await resolvePrompt(chat, state.settings, userId);
     const existingText = !rebuild && existing?.content?.trim() ? existing.content.trim() : "(empty \u2014 initial pass)";
     const transcript = formatTranscript(fresh);
@@ -253,13 +268,13 @@ function ledgerService(host) {
     });
     const content = stripReasoning(string(result?.content ?? "", "model response", 200000));
     check(content, "The model returned an empty ledger.");
-    const last = messages.at(-1);
+    const last = eligible.at(-1);
     state.ledgers[chat.id] = {
       chatId: chat.id,
       content,
       previousContent: existing ? existing.content : null,
       lastMessageId: last?.id ?? null,
-      lastMessageCount: messages.length,
+      lastMessageCount: eligible.length,
       updatedAt: new Date().toISOString(),
       source
     };
@@ -275,6 +290,7 @@ function ledgerService(host) {
       state.settings = normalizeSettings({
         autoUpdate: req.autoUpdate,
         interval: req.interval,
+        skipRecent: req.skipRecent,
         connectionId: req.connectionId ?? "",
         fallbackPrompt: string(req.fallbackPrompt ?? "", "fallback ledger prompt")
       });
@@ -291,11 +307,18 @@ function ledgerService(host) {
       if (!chat?.id)
         return { updated: false };
       const messages = await fetchMessages(host, chat.id, userId);
+      const eligible = eligibleMessages(messages, state.settings.skipRecent);
+      const heldBackTurns = messages.length - eligible.length;
       const existing = state.ledgers[chat.id] ?? null;
-      const fresh = selectNewMessages(messages, existing, false);
+      const fresh = selectNewMessages(eligible, existing, false);
       const newAssistantTurns = fresh.filter((m) => m.role === "assistant").length;
       if (newAssistantTurns < state.settings.interval) {
-        return { updated: false, pendingTurns: fresh.length, pendingAssistantTurns: newAssistantTurns };
+        return {
+          updated: false,
+          pendingTurns: fresh.length,
+          pendingAssistantTurns: newAssistantTurns,
+          heldBackTurns
+        };
       }
       const status = await runUpdate(state, chat.id, userId, { rebuild: false, source: "auto" });
       return { updated: true, ...status };
